@@ -134,11 +134,17 @@ with camera_tab:
             "video": True,
             "audio": False,
         },
+        rtc_configuration={
+            "iceServers": [
+                {
+                    "urls": [
+                        "stun:stun.l.google.com:19302"
+                    ]
+                }
+            ]
+        },
         async_processing=True,
     )
-
-    if ctx.video_processor:
-        ctx.video_processor.confidence = confidence
 
 # ---------------- IMAGE UPLOAD ----------------
 with image_tab:
