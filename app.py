@@ -1,5 +1,6 @@
 
 import io
+import time
 import threading
 from pathlib import Path
 
@@ -8,14 +9,19 @@ import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
-from streamlit_webrtc import (
-    VideoProcessorBase,
-    webrtc_streamer,
-)
+from streamlit_webrtc import VideoProcessorBase, webrtc_streamer
+from ultralytics import YOLO
 
-# ---------------- CONFIGURATION ----------------
+
+# =====================================================
+# CONFIGURATION
+# =====================================================
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "best.pt"
+
+IMAGE_SIZE = 416
+MAX_IMAGE_SIDE = 640
+DEFAULT_CONFIDENCE = 0.25
 
 st.set_page_config(
     page_title="YOLO11 Weapon Detection",
@@ -23,84 +29,124 @@ st.set_page_config(
     layout="wide",
 )
 
-# ---------------- LOAD MODEL ----------------
-@st.cache_resource
-def load_model(path):
-    from ultralytics import YOLO
-    return YOLO(str(path))
 
-if not MODEL_PATH.exists():
-    st.error(f"Model not found: {MODEL_PATH}")
+# =====================================================
+# LOAD MODEL ONCE
+# =====================================================
+@st.cache_resource
+def load_model(model_path):
+    return YOLO(str(model_path))
+
+
+st.title("🔍 YOLO11 Weapon Detection")
+st.write(
+    "Upload an image for automatic weapon detection, "
+    "or use your webcam when available."
+)
+
+if not MODEL_PATH.is_file():
+    st.error(f"Model file not found: {MODEL_PATH}")
     st.stop()
 
 try:
-    model = load_model(str(MODEL_PATH))
+    with st.spinner("Loading weapon detection model..."):
+        model = load_model(str(MODEL_PATH))
 except Exception as exc:
-    st.error(f"Unable to load YOLO model: {exc}")
+    st.error(f"Model loading failed: {type(exc).__name__}: {exc}")
     st.stop()
 
 MODEL_LOCK = threading.Lock()
 
 
-import time
-import cv2
-import numpy as np
-from PIL import Image
+# =====================================================
+# DETECTION FUNCTION
+# =====================================================
+def detect_weapons(image, confidence):
+    # Resize large images to reduce CPU processing time.
+    image = image.convert("RGB")
+    image.thumbnail(
+        (MAX_IMAGE_SIDE, MAX_IMAGE_SIDE),
+        Image.Resampling.LANCZOS,
+    )
 
-def detect_image_fast(image, confidence=0.35):
-    # Resize large images to reduce CPU inference time
-    max_side = 960
-    image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    image_rgb = np.asarray(image)
+    image_bgr = cv2.cvtColor(
+        image_rgb, cv2.COLOR_RGB2BGR
+    )
 
-    image_rgb = np.array(image)
-    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    start_time = time.perf_counter()
 
-    start = time.time()
+    with MODEL_LOCK:
+        result = model.predict(
+            source=image_bgr,
+            conf=confidence,
+            imgsz=IMAGE_SIZE,
+            device="cpu",
+            verbose=False,
+        )[0]
 
-    result = model.predict(
-        source=image_bgr,
-        conf=confidence,
-        imgsz=416,
-        device="cpu",
-        verbose=False,
-    )[0]
+    elapsed = time.perf_counter() - start_time
 
-    annotated = cv2.cvtColor(
-        result.plot(), cv2.COLOR_BGR2RGB
+    # Generate the annotated image.
+    annotated_bgr = result.plot()
+    annotated_rgb = cv2.cvtColor(
+        annotated_bgr, cv2.COLOR_BGR2RGB
     )
 
     detections = []
+
     for box in result.boxes:
         class_id = int(box.cls.item())
+        score = float(box.conf.item())
+        xyxy = box.xyxy[0].tolist()
+
         detections.append({
             "Class": result.names[class_id],
-            "Confidence": round(float(box.conf.item()), 4),
+            "Confidence": round(score, 4),
+            "X1": round(xyxy[0], 1),
+            "Y1": round(xyxy[1], 1),
+            "X2": round(xyxy[2], 1),
+            "Y2": round(xyxy[3], 1),
         })
 
-    elapsed = time.time() - start
-    return annotated, detections, elapsed
+    return annotated_rgb, detections, elapsed
 
 
-
-# ---------------- WEBCAM PROCESSOR ----------------
+# =====================================================
+# WEBCAM PROCESSOR
+# =====================================================
 class WeaponProcessor(VideoProcessorBase):
     def __init__(self):
-        self.confidence = 0.35
+        self.confidence = DEFAULT_CONFIDENCE
 
     def recv(self, frame):
         frame_bgr = frame.to_ndarray(format="bgr24")
+
+        # Reduce frame size for CPU inference.
+        height, width = frame_bgr.shape[:2]
+
+        if width > 480:
+            new_height = int(height * 480 / width)
+            frame_bgr = cv2.resize(
+                frame_bgr,
+                (480, new_height),
+                interpolation=cv2.INTER_AREA,
+            )
 
         try:
             with MODEL_LOCK:
                 result = model.predict(
                     source=frame_bgr,
                     conf=self.confidence,
-                    imgsz=640,
+                    imgsz=IMAGE_SIZE,
+                    device="cpu",
                     verbose=False,
                 )[0]
 
             annotated = result.plot()
+
         except Exception:
+            # Keep the camera stream alive if a frame fails.
             annotated = frame_bgr
 
         return av.VideoFrame.from_ndarray(
@@ -108,36 +154,34 @@ class WeaponProcessor(VideoProcessorBase):
         )
 
 
-# ---------------- WEBSITE ----------------
-st.title("YOLO11 Weapon Detection")
-st.write(
-    "Detect knives and pistols using a live webcam "
-    "or an uploaded image. No camera is needed for image testing."
-)
-st.warning(
-    "AI detections can be incorrect. A missing detection "
-    "does not prove that a weapon is absent."
-)
-
+# =====================================================
+# SETTINGS
+# =====================================================
 confidence = st.slider(
-    "Confidence threshold",
+    "Detection confidence threshold",
     min_value=0.10,
     max_value=0.95,
-    value=0.35,
+    value=DEFAULT_CONFIDENCE,
     step=0.05,
+    help="Lower values may detect more objects but can increase false positives.",
 )
 
 camera_tab, image_tab = st.tabs(
-    ["Live Webcam", "Upload Image"]
+    ["📷 Live Webcam", "🖼️ Automatic Image Detection"]
 )
 
-# ---------------- LIVE WEBCAM ----------------
+
+# =====================================================
+# LIVE WEBCAM
+# =====================================================
 with camera_tab:
-    st.subheader("Live camera detection")
+    st.subheader("Live Weapon Detection")
+
     st.info(
-        "Allow camera permission in your browser, then click START. "
-        "Live camera access works from the deployed HTTPS website "
-        "or localhost."
+        "Click START to enable your browser camera. "
+        "Allow camera permission when prompted. "
+        "This feature requires a camera on the device "
+        "opening the website."
     )
 
     ctx = webrtc_streamer(
@@ -159,51 +203,103 @@ with camera_tab:
         async_processing=True,
     )
 
-# ---------------- IMAGE UPLOAD ----------------
+    if ctx.video_processor is not None:
+        ctx.video_processor.confidence = confidence
+
+
+# =====================================================
+# AUTOMATIC IMAGE DETECTION
+# =====================================================
 with image_tab:
+    st.subheader("Upload an Image")
+
     uploaded = st.file_uploader(
-        "Upload a JPG, JPEG, PNG, or WEBP image",
-        type=["jpg", "jpeg", "png", "webp"],
+        "Choose an image — detection starts automatically",
+        type=["jpg", "jpeg", "png", "webp", "bmp"],
+        key="weapon-image-upload",
     )
 
     if uploaded is not None:
         try:
+            # Read uploaded image.
             image = Image.open(uploaded).convert("RGB")
-            st.image(image, caption="Uploaded image",
-                     use_container_width=True)
 
-            if st.button("Detect weapons", type="primary"):
-                try:
-                    with st.spinner("Detecting weapons... please wait"):
-                        annotated, detections, elapsed = detect_image_fast(
-                            image.copy(), confidence
-                        )
+            st.image(
+                image,
+                caption="Uploaded Image",
+                use_container_width=True,
+            )
 
-                st.success(f"Detection completed in {elapsed:.2f} seconds.")
+            # Cache the result for this uploaded file and
+            # confidence value to avoid repeat inference on reruns.
+            @st.cache_data(show_spinner=False, max_entries=4)
+            def cached_detection(image_bytes, confidence_value):
+                pil_image = Image.open(
+                    io.BytesIO(image_bytes)
+                ).convert("RGB")
 
-                st.subheader("Detection result")
-                st.image(annotated, use_container_width=True)
-
-                if detections:
-                    st.dataframe(detections, use_container_width=True)
-                else:
-                    st.info("No objects detected at this confidence threshold.")
-
-                import io
-
-                output = io.BytesIO()
-                Image.fromarray(annotated).save(output, format="PNG")
-
-                st.download_button(
-                    "Download detection result",
-                    data=output.getvalue(),
-                    file_name="weapon_detection_result.png",
-                    mime="image/png",
+                annotated, detections, elapsed = detect_weapons(
+                    pil_image, confidence_value
                 )
 
-            except Exception as exc:
-            st.error(f"Detection failed: {type(exc).__name__}: {exc}")
+                buffer = io.BytesIO()
+                Image.fromarray(annotated).save(
+                    buffer, format="PNG"
+                )
 
+                return (
+                    buffer.getvalue(),
+                    detections,
+                    elapsed,
+                )
+
+            image_bytes = uploaded.getvalue()
+
+            with st.spinner("Detecting weapons..."):
+                output_bytes, detections, elapsed = cached_detection(
+                    image_bytes, confidence
+                )
+
+            st.subheader("Detection Result")
+
+            st.image(
+                output_bytes,
+                caption=f"Inference time: {elapsed:.2f} seconds",
+                use_container_width=True,
+            )
+
+            if detections:
+                st.success(
+                    f"Detected {len(detections)} object(s)."
+                )
+                st.dataframe(
+                    detections,
+                    use_container_width=True,
+                )
+            else:
+                st.info(
+                    "No objects detected at the selected confidence "
+                    "threshold. This does not prove that no weapon "
+                    "is present."
+                )
+
+            st.download_button(
+                "Download Annotated Image",
+                data=output_bytes,
+                file_name="weapon_detection_result.png",
+                mime="image/png",
+            )
+
+        except Exception as exc:
+            st.error(
+                f"Image detection failed: {type(exc).__name__}: {exc}"
+            )
+
+
+# =====================================================
+# FOOTER
+# =====================================================
 st.caption(
-    "For demonstration purposes. Verify predictions independently."
+    "YOLO predictions are estimates. Always verify detections "
+    "independently before making decisions."
 )
