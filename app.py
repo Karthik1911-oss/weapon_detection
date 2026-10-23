@@ -210,89 +210,92 @@ with camera_tab:
 # =====================================================
 # AUTOMATIC IMAGE DETECTION
 # =====================================================
-with image_tab:
-    st.subheader("Upload an Image")
 
+# =====================================================
+# AUTOMATIC IMAGE DETECTION
+# =====================================================
+with image_tab:
     uploaded = st.file_uploader(
-        "Choose an image — detection starts automatically",
+        "Upload an image for automatic weapon detection",
         type=["jpg", "jpeg", "png", "webp", "bmp"],
         key="weapon-image-upload",
     )
 
     if uploaded is not None:
         try:
-            # Read uploaded image.
-            image = Image.open(uploaded).convert("RGB")
+            image_bytes = uploaded.getvalue()
+            image = Image.open(
+                io.BytesIO(image_bytes)
+            ).convert("RGB")
 
             st.image(
                 image,
-                caption="Uploaded Image",
+                caption="Uploaded image",
                 use_container_width=True,
             )
 
-            # Cache the result for this uploaded file and
-            # confidence value to avoid repeat inference on reruns.
-            @st.cache_data(show_spinner=False, max_entries=4)
-            def cached_detection(image_bytes, confidence_value):
-                pil_image = Image.open(
-                    io.BytesIO(image_bytes)
-                ).convert("RGB")
-
-                annotated, detections, elapsed = detect_weapons(
-                    pil_image, confidence_value
+            # Run inference only once per uploaded image
+            # and confidence setting during this session.
+            if (
+                st.session_state.get("last_image_id")
+                != (uploaded.name, len(image_bytes), confidence)
+            ):
+                st.session_state.pop("detection_result", None)
+                st.session_state["last_image_id"] = (
+                    uploaded.name, len(image_bytes), confidence
                 )
+
+                with st.spinner("Detecting weapons..."):
+                    annotated, detections, elapsed = detect_weapons(
+                        image.copy(), confidence
+                    )
 
                 buffer = io.BytesIO()
                 Image.fromarray(annotated).save(
                     buffer, format="PNG"
                 )
 
-                return (
-                    buffer.getvalue(),
-                    detections,
-                    elapsed,
-                )
+                st.session_state["detection_result"] = {
+                    "image": buffer.getvalue(),
+                    "detections": detections,
+                    "elapsed": elapsed,
+                }
 
-            image_bytes = uploaded.getvalue()
+            output = st.session_state.get("detection_result")
 
-            with st.spinner("Detecting weapons..."):
-                output_bytes, detections, elapsed = cached_detection(
-                    image_bytes, confidence
-                )
-
-            st.subheader("Detection Result")
-
-            st.image(
-                output_bytes,
-                caption=f"Inference time: {elapsed:.2f} seconds",
-                use_container_width=True,
-            )
-
-            if detections:
+            if output is not None:
                 st.success(
-                    f"Detected {len(detections)} object(s)."
+                    f"Detection completed in "
+                    f"{output['elapsed']:.2f} seconds."
                 )
-                st.dataframe(
-                    detections,
+
+                st.subheader("Detection Result")
+                st.image(
+                    output["image"],
                     use_container_width=True,
                 )
-            else:
-                st.info(
-                    "No objects detected at the selected confidence "
-                    "threshold. This does not prove that no weapon "
-                    "is present."
-                )
 
-            st.download_button(
-                "Download Annotated Image",
-                data=output_bytes,
-                file_name="weapon_detection_result.png",
-                mime="image/png",
-            )
+                if output["detections"]:
+                    st.dataframe(
+                        output["detections"],
+                        use_container_width=True,
+                    )
+                else:
+                    st.info(
+                        "No objects detected at this confidence "
+                        "threshold."
+                    )
+
+                st.download_button(
+                    "Download detection result",
+                    data=output["image"],
+                    file_name="weapon_detection_result.png",
+                    mime="image/png",
+                )
 
         except Exception as exc:
             st.error(
-                f"Image detection failed: {type(exc).__name__}: {exc}"
+                f"Detection failed: {type(exc).__name__}: {exc}"
             )
 
 
