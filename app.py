@@ -42,23 +42,34 @@ except Exception as exc:
 MODEL_LOCK = threading.Lock()
 
 
-def detect_image(image_rgb, confidence):
+import time
+import cv2
+import numpy as np
+from PIL import Image
+
+def detect_image_fast(image, confidence=0.35):
+    # Resize large images to reduce CPU inference time
+    max_side = 960
+    image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+
+    image_rgb = np.array(image)
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
 
-    with MODEL_LOCK:
-        result = model.predict(
-            source=image_bgr,
-            conf=confidence,
-            imgsz=640,
-            verbose=False,
-        )[0]
+    start = time.time()
 
-    annotated_bgr = result.plot()
-    annotated_rgb = cv2.cvtColor(
-        annotated_bgr, cv2.COLOR_BGR2RGB
+    result = model.predict(
+        source=image_bgr,
+        conf=confidence,
+        imgsz=416,
+        device="cpu",
+        verbose=False,
+    )[0]
+
+    annotated = cv2.cvtColor(
+        result.plot(), cv2.COLOR_BGR2RGB
     )
-    detections = []
 
+    detections = []
     for box in result.boxes:
         class_id = int(box.cls.item())
         detections.append({
@@ -66,7 +77,9 @@ def detect_image(image_rgb, confidence):
             "Confidence": round(float(box.conf.item()), 4),
         })
 
-    return annotated_rgb, detections
+    elapsed = time.time() - start
+    return annotated, detections, elapsed
+
 
 
 # ---------------- WEBCAM PROCESSOR ----------------
@@ -160,41 +173,36 @@ with image_tab:
                      use_container_width=True)
 
             if st.button("Detect weapons", type="primary"):
-                with st.spinner("Running YOLO detection..."):
-                    annotated, detections = detect_image(
-                        np.array(image), confidence
-                    )
+                try:
+                    with st.spinner("Detecting weapons... please wait"):
+                        annotated, detections, elapsed = detect_image_fast(
+                            image.copy(), confidence
+                        )
+
+                st.success(f"Detection completed in {elapsed:.2f} seconds.")
 
                 st.subheader("Detection result")
                 st.image(annotated, use_container_width=True)
 
                 if detections:
-                    st.success(
-                        f"Detected {len(detections)} object(s)."
-                    )
-                    st.dataframe(
-                        detections, use_container_width=True
-                    )
+                    st.dataframe(detections, use_container_width=True)
                 else:
-                    st.info(
-                        "No objects detected above the selected "
-                        "confidence threshold."
-                    )
+                    st.info("No objects detected at this confidence threshold.")
 
-                buffer = io.BytesIO()
-                Image.fromarray(annotated).save(
-                    buffer, format="PNG"
-                )
+                import io
+
+                output = io.BytesIO()
+                Image.fromarray(annotated).save(output, format="PNG")
 
                 st.download_button(
-                    "Download annotated image",
-                    data=buffer.getvalue(),
+                    "Download detection result",
+                    data=output.getvalue(),
                     file_name="weapon_detection_result.png",
                     mime="image/png",
                 )
 
-        except Exception as exc:
-            st.error(f"Image processing failed: {exc}")
+            except Exception as exc:
+            st.error(f"Detection failed: {type(exc).__name__}: {exc}")
 
 st.caption(
     "For demonstration purposes. Verify predictions independently."
