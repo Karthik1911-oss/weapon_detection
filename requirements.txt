@@ -1,4 +1,7 @@
+
 streamlit
 inference-sdk
-Pillow
+streamlit-webrtc
 opencv-python-headless
+Pillow
+numpy<2
