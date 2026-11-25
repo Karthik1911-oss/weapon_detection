@@ -1,8 +1,3 @@
-
 streamlit
-ultralytics
-opencv-python-headless
-streamlit-webrtc
-av
-pillow
-numpy
+inference-sdk
+Pillow
